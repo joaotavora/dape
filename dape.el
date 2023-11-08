@@ -276,7 +276,7 @@ The hook is run with one argument, the compilation buffer."
   "List of watched expressions.")
 (defvar dape--server-process nil
   "Debug adapter server process.")
-(defvar dape--process nil
+(defvar dape--debugger nil
   "Debug adapter communications process.")
 (defvar dape--parent-process nil
   "Debug adapter parent process.  Used for by startDebugging adapters.")
@@ -493,8 +493,8 @@ If EXTENDED end of line is after newline."
     (dolist (timer (hash-table-values dape--timers))
       (cancel-timer timer)))
   (ignore-errors
-    (and dape--process
-         (delete-process dape--process))
+    (and dape--debugger
+         (delete-process dape--debugger))
     (and dape--server-process
          (delete-process dape--server-process))
     (and dape--parent-process
@@ -544,14 +544,14 @@ See `dape-debug-on' for TYPE information."
 (defun dape--live-process (&optional nowarn)
   "Get current live process.
 If NOWARN does not error on no active process."
-  (if (and dape--process
-           (processp dape--process)
-           (process-live-p dape--process))
-      dape--process
+  (if (and dape--debugger
+           (processp dape--debugger)
+           (process-live-p dape--debugger))
+      dape--debugger
     (unless nowarn
       (user-error "No debug process live"))))
 
-(defun dape--process-sentinel (process _msg)
+(defun dape--debugger-sentinel (process _msg)
   "Sentinel for Dape processes."
   (unless (process-live-p process)
     (dape--remove-stack-pointers)
@@ -559,7 +559,7 @@ If NOWARN does not error on no active process."
     ;; Clean mode-line after 2 seconds
     (run-with-timer 2 nil (lambda ()
                             (unless (dape--live-process t)
-                              (setq dape--process nil)
+                              (setq dape--debugger nil)
                               (force-mode-line-update t))))
     (dape--debug 'info "\nProcess %S exited with %d"
                  (process-command process)
@@ -603,7 +603,7 @@ If NOWARN does not error on no active process."
                           seq dape--seq-event)))))
       (_ (dape--debug 'info "No handler for type %s" type)))))
 
-(defun dape--process-filter (process string)
+(defun dape--debugger-filter (process string)
   "Filter for Dape processes."
   (when-let (((process-live-p process))
              (input-buffer (process-buffer process))
@@ -1029,7 +1029,7 @@ Starts a new process to run process to be debugged."
 (cl-defmethod dape-handle-request (_process (_command (eql startDebugging)) arguments)
   "Handle startDebugging requests.
 Starts a new process as per request of the debug adapter."
-  (setq dape--parent-process dape--process)
+  (setq dape--parent-process dape--debugger)
   (dape (plist-put dape--config
                    'start-debugging
                    (plist-get arguments :configuration))))
@@ -1143,7 +1143,7 @@ Starts a new process as per request of the debug adapter."
         dape--capabilities nil
         dape--threads nil
         dape--stack-id nil
-        dape--process process
+        dape--debugger process
         dape--restart-in-progress nil
         dape--widget-guard nil
         dape--repl-insert-text-guard nil)
@@ -1176,7 +1176,7 @@ Starts a new process as per request of the debug adapter."
                                          (cl-map 'list 'identity
                                                  (plist-get config 'command-args)))
                           :buffer buffer
-                          :sentinel 'dape--process-sentinel
+                          :sentinel 'dape--debugger-sentinel
                           :filter (lambda (_process string)
                                     (dape--debug 'std-server
                                                  "Server stdout:\n%s"
@@ -1193,8 +1193,8 @@ Starts a new process as per request of the debug adapter."
                                     :host host
                                     :coding 'utf-8-emacs-unix
                                     :service (plist-get config 'port)
-                                    :sentinel 'dape--process-sentinel
-                                    :filter 'dape--process-filter
+                                    :sentinel 'dape--debugger-sentinel
+                                    :filter 'dape--debugger-filter
                                     :noquery t)))
       (sleep-for 0 100)
       (setq retries (1- retries)))
@@ -1219,8 +1219,8 @@ Starts a new process as per request of the debug adapter."
                                                        (plist-get config 'command-args)))
                                 :connection-type 'pipe
                                 :coding 'utf-8-emacs-unix
-                                :sentinel 'dape--process-sentinel
-                                :filter 'dape--process-filter
+                                :sentinel 'dape--debugger-sentinel
+                                :filter 'dape--debugger-filter
                                 :buffer buffer
                                 :noquery t))
     (dape--debug 'info "Process started %S" (process-command process))
@@ -1266,7 +1266,7 @@ Starts a new process as per request of the debug adapter."
     (setq dape--threads nil)
     (setq dape--thread-id nil)
     (setq dape--restart-in-progress t)
-    (dape-request dape--process "restart" nil
+    (dape-request dape--debugger "restart" nil
                   (dape--callback
                    (setq dape--restart-in-progress nil))))
    ((and dape--config)
@@ -1284,7 +1284,7 @@ CB will be called after adapter termination."
    ((and (dape--live-process t)
          (plist-get dape--capabilities
                     :supportsTerminateRequest))
-    (dape-request dape--process
+    (dape-request dape--debugger
                   "terminate"
                   nil
                   (dape--callback
@@ -1292,7 +1292,7 @@ CB will be called after adapter termination."
                    (when cb
                      (funcall cb nil)))))
    ((dape--live-process t)
-    (dape-request dape--process
+    (dape-request dape--debugger
                   "disconnect"
                   `(:restart nil .
                              ,(when (plist-get dape--capabilities
@@ -2805,7 +2805,7 @@ See `eldoc-documentation-functions', for more infomation."
            'face 'mode-line-emphasis)))
 
 (add-to-list 'mode-line-misc-info
-             `(dape--process
+             `(dape--debugger
                (" [" (:eval (dape--mode-line-format)) "] ")))
 
 
