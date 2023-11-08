@@ -2725,7 +2725,7 @@ See `dape--config-mode-p' how \"valid\" is defined."
                     #'dape--config-completion-at-point nil t))
       (pcase-let* ((str (read-from-minibuffer "Run adapter: "
                                               initial-contents
-                                              read--expression-map nil
+                                              nil nil
                                               'dape-history
                                               initial-contents))
                    (`(,key ,config) (dape--config-from-string
