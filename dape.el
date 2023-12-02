@@ -36,6 +36,7 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'jsonrpc)
 (require 'subr-x)
 (require 'seq)
 (require 'font-lock)
@@ -276,8 +277,9 @@ The hook is run with one argument, the compilation buffer."
   "List of watched expressions.")
 (defvar dape--server-process nil
   "Debug adapter server process.")
+;; FIXME: Shouldn't this be "debugging-session local"? OK for now.
 (defvar dape--debugger nil
-  "Debug adapter communications process.")
+  "Debug adapter connection.  Instance of `dape-dap-debugger'")
 (defvar dape--parent-process nil
   "Debug adapter parent process.  Used for by startDebugging adapters.")
 (defvar dape--restart-in-progress nil
@@ -492,13 +494,12 @@ If EXTENDED end of line is after newline."
   (when (hash-table-p dape--timers)
     (dolist (timer (hash-table-values dape--timers))
       (cancel-timer timer)))
-  (ignore-errors
-    (and dape--debugger
-         (delete-process dape--debugger))
-    (and dape--server-process
-         (delete-process dape--server-process))
-    (and dape--parent-process
-         (delete-process dape--parent-process))))
+  (and dape--debugger
+       (jsonrpc-shutdown dape--debugger))
+  (and dape--server-process
+       (delete-process dape--server-process))
+  (and dape--parent-process
+       (delete-process dape--parent-process)))
 
 (defun dape--kill-buffers (&optional skip-process-buffers)
   "Kill all Dape related buffers.
@@ -545,25 +546,10 @@ See `dape-debug-on' for TYPE information."
   "Get current live process.
 If NOWARN does not error on no active process."
   (if (and dape--debugger
-           (processp dape--debugger)
-           (process-live-p dape--debugger))
+           (jsonrpc-running-p dape--debugger))
       dape--debugger
     (unless nowarn
       (user-error "No debug process live"))))
-
-(defun dape--debugger-sentinel (process _msg)
-  "Sentinel for Dape processes."
-  (unless (process-live-p process)
-    (dape--remove-stack-pointers)
-    (dape--variable-remove-overlays)
-    ;; Clean mode-line after 2 seconds
-    (run-with-timer 2 nil (lambda ()
-                            (unless (dape--live-process t)
-                              (setq dape--debugger nil)
-                              (force-mode-line-update t))))
-    (dape--debug 'info "\nProcess %S exited with %d"
-                 (process-command process)
-                 (process-exit-status process))))
 
 (defun dape--handle-object (process object)
   "Handle a incoming parsed OBJECT from PROCESS."
@@ -682,20 +668,12 @@ If NOWARN does not error on no active process."
     (dape--debug 'io "Sending:\n%s" object)
     (process-send-string process string)))
 
-(defun dape-request (process command arguments &optional cb)
+(defun dape-request (bugger command arguments &optional cb)
   "Send request COMMAND to PROCESS with ARGUMENTS.
 If CB set, invoke CB on response.
 See `dape--callback' for expected function signature."
-  (let ((seq (setq dape--seq (1+ dape--seq)))
-        (object (and arguments (list :arguments arguments))))
-    (dape--create-timer process seq)
-    (when cb
-      (puthash seq cb dape--cb))
-    (dape-send-object process
-                      seq
-                      (thread-first object
-                                    (plist-put :type "request")
-                                    (plist-put :command command)))))
+  (jsonrpc-async-request bugger command arguments
+                         :success-fn cb))
 
 (defun dape--initialize (process)
   "Send initialize request to PROCESS."
@@ -1128,6 +1106,71 @@ Starts a new process as per request of the debug adapter."
   (unless dape--restart-in-progress
     (dape-kill)))
 
+(defclass dape-dap-debugger (jsonrpc-process-connection)
+  (;; (capabilities
+   ;;  :documentation "JSON object containing server capabilities."
+   ;;  :accessor dape--capabilities)
+   ;; (server-info
+   ;;  :documentation "JSON object containing server info."
+   ;;  :accessor dape--server-info)
+   ;; (shutdown-requested
+   ;;  :documentation "Flag set when server is shutting down."
+   ;;  :accessor dape--shutdown-requested)
+   ;; (project
+   ;;  :documentation "Project associated with server."
+   ;;  :accessor dape--project)
+   ;; (inhibit-autoreconnect
+   ;;  :initform t
+   ;;  :documentation "Generalized boolean inhibiting auto-reconnection if true."
+   ;;  :accessor dape--inhibit-autoreconnect)
+   ;; (file-watches
+   ;;  :documentation "Map (DIR -> (WATCH ID1 ID2...)) for `didChangeWatchedFiles'."
+   ;;  :initform (make-hash-table :test #'equal) :accessor dape--file-watches)
+   ;; (managed-buffers
+   ;;  :documentation "List of buffers managed by server."
+   ;;  :accessor dape--managed-buffers)
+   ;; (saved-initargs
+   ;;  :documentation "Saved initargs for reconnection purposes."
+   ;;  :accessor dape--saved-initargs)
+   ;; (inferior-process
+   ;;  :documentation "Server subprocess started automatically."
+   ;;  :accessor dape--inferior-process)
+   (last-id
+    :documentation "Used for converting JSONRPC id numbers to DAP seq numbers." )
+   (n-sent-notifs
+    :documentation "Used for converting JSONRPC id numbers to DAP seq numbers." )
+   )
+  :documentation
+  "Represents a DAP debugger. Wraps a process for DAP communication.")
+
+(cl-defmethod jsonrpc-convert-from-jsonrpc ((bugger dape-dap-debugger) message)
+  (cl-destructuring-bind (&key method id error params result _jsonrpc) message
+    (with-slots (last-id n-sent-notifs) bugger
+      (cond ((null id) ; a notification to the dap server
+             (cl-incf n-sent-notifs)
+             (list :type :event
+                   :seq (+ last-id n-sent-notifs)
+                   :event method
+                   :body params)
+             )
+            (error ; an error response to the dap server
+             (list :type :response
+                   :seq (+ (setq last-id id) n-sent-notifs)
+                   :success :json-false
+                   :message (plist-get error :message)
+                   :body (plist-get error :data)))
+            (result ; a successful response to the dap server
+             (list  :type :response
+                    :seq (+ (setq last-id id) n-sent-notifs)
+                    :success t
+                    :body result))
+            
+
+            ))
+    )
+
+  )
+
 
 ;;; Startup/Setup
 
@@ -1167,36 +1210,53 @@ Starts a new process as per request of the debug adapter."
                                default-directory))
         (host (or (plist-get config 'host) "localhost"))
         (retries 30)
-        process)
+        command debugger)
     (when (and (plist-get config 'command)
                (not (plist-get config 'start-debugging)))
-      (setq dape--server-process
-            (make-process :name "Dape adapter"
-                          :command (cons (plist-get config 'command)
-                                         (cl-map 'list 'identity
-                                                 (plist-get config 'command-args)))
-                          :buffer buffer
-                          :sentinel 'dape--debugger-sentinel
-                          :filter (lambda (_process string)
-                                    (dape--debug 'std-server
-                                                 "Server stdout:\n%s"
-                                                 string))
-                          :noquery t))
-      (dape--debug 'info "Server process started %S"
-                   (process-command dape--server-process)))
-    (while (and (not process)
+      (setq
+       command (cons (plist-get config 'command)
+                     (cl-map 'list 'identity
+                             (plist-get config 'command-args)))
+       dape--server-process
+       (make-process :name "Dape adapter"
+                     :command command
+                     :buffer buffer
+                     :sentinel (lambda (p _msg)
+                                 (when dape--debugger
+                                   (jsonrpc--debug dape--debugger "\nProcess %S exited with %d"
+                                                   (process-command p)
+                                                   (process-exit-status p))))
+                     :filter (lambda (_process string)
+                               (dape--debug 'std-server
+                                            "Server stdout:\n%s"
+                                            string))
+                     :noquery t))
+      (dape--debug 'info "Server process started %S" command))
+    (while (and (not debugger)
                 (> retries 0))
       (ignore-errors
-        (setq process
-              (make-network-process :name "Dape adapter connection"
-                                    :buffer buffer
-                                    :host host
-                                    :coding 'utf-8-emacs-unix
-                                    :service (plist-get config 'port)
-                                    :sentinel 'dape--debugger-sentinel
-                                    :filter 'dape--debugger-filter
-                                    :noquery t)))
-      (sleep-for 0 100)
+        (setq debugger
+              (make-instance
+               'dape-dap-debugger
+               :name "DAPEDOPE"
+               :request-dispatcher nil
+               :notification-dispatcher nil
+               :events-buffer-scrollback-size nil
+               :on-shutdown (lambda (bugger)
+                              (setq dape--config nil)
+                              (dape--remove-stack-pointers)
+                              (dape--variable-remove-overlays)
+                              (jsonrpc--debug bugger "network process byebye")
+                              (setq dape--debugger nil)
+                              (force-mode-line-update t))
+               :process (make-network-process
+                         :name "Dape adapter connection"
+                         :buffer buffer
+                         :host host
+                         :coding 'utf-8-emacs-unix
+                         :service (plist-get config 'port)
+                         :noquery t))))
+      (sleep-for 0.1)
       (setq retries (1- retries)))
     (if (zerop retries)
         (user-error "Unable to connect to server %s:%d"
@@ -1204,7 +1264,7 @@ Starts a new process as per request of the debug adapter."
                     (plist-get config 'port))
       (dape--debug 'info "Connection to server established %s:%s"
                    host (plist-get config 'port)))
-    (dape--setup process config)))
+    (dape--setup debugger config)))
 
 (defun dape--start-single-session (config)
   "Start single session for CONFIG."
@@ -1212,19 +1272,28 @@ Starts a new process as per request of the debug adapter."
   (let ((buffer (dape--get-buffer))
         (default-directory (or (plist-get config 'command-cwd)
                                default-directory))
-        process)
-    (setq process (make-process :name "Dape adapter"
-                                :command (cons (plist-get config 'command)
-                                               (cl-map 'list 'identity
-                                                       (plist-get config 'command-args)))
-                                :connection-type 'pipe
-                                :coding 'utf-8-emacs-unix
-                                :sentinel 'dape--debugger-sentinel
-                                :filter 'dape--debugger-filter
-                                :buffer buffer
-                                :noquery t))
-    (dape--debug 'info "Process started %S" (process-command process))
-    (dape--setup process config)))
+        (command (cons (plist-get config 'command)
+                       (cl-map 'list 'identity
+                               (plist-get config 'command-args))))
+        debugger)
+    (setq debugger
+          (make-instance
+           'dape-dap-debugger
+           :name "DAPEDOPE"
+           :request-dispatcher nil
+           :notification-dispatcher nil
+           :events-buffer-scrollback-size nil
+           :on-shutdown (lambda (_bugger)
+                              (with-current-buffer buffer
+                                (setq dape--debugger nil)))
+           :process (make-process :name "Dape adapter"
+                                  :command command
+                                  :connection-type 'pipe
+                                  :coding 'utf-8-emacs-unix
+                                  :buffer buffer
+                                  :noquery t)))
+    (dape--debug 'info "Process started %S" command)
+    (dape--setup debugger config)))
 
 
 ;;; Commands
@@ -1273,39 +1342,43 @@ Starts a new process as per request of the debug adapter."
     (dape dape--config))
    ((user-error "Unable to derive session to restart"))))
 
-(defun dape-kill (&optional cb)
-  "Kill debug session.
+(defun dape-kill (&optional _cb)
+  "Attempt to politely terminate debug session.
 CB will be called after adapter termination."
   (interactive)
-  (when (hash-table-p dape--timers)
-    (dolist (timer (hash-table-values dape--timers))
-      (cancel-timer timer)))
-  (cond
-   ((and (dape--live-process t)
-         (plist-get dape--capabilities
-                    :supportsTerminateRequest))
-    (dape-request dape--debugger
-                  "terminate"
-                  nil
-                  (dape--callback
-                   (dape--kill-processes)
-                   (when cb
-                     (funcall cb nil)))))
-   ((dape--live-process t)
-    (dape-request dape--debugger
-                  "disconnect"
-                  `(:restart nil .
-                             ,(when (plist-get dape--capabilities
-                                               :supportTerminateDebuggee)
-                                (list :terminateDebuggee t)))
-                  (dape--callback
-                   (dape--kill-processes)
-                   (when cb
-                     (funcall cb nil)))))
-   (t
-    (dape--kill-processes)
-    (when cb
-      (funcall cb nil)))))
+  ;; FIXME start by being unpolite as hell
+  (when dape--debugger
+    (jsonrpc-shutdown dape--debugger))
+  ;; (when (hash-table-p dape--timers)
+  ;;   (dolist (timer (hash-table-values dape--timers))
+  ;;     (cancel-timer timer)))
+  ;; (cond
+  ;;  ((and (dape--live-process t)
+  ;;        (plist-get dape--capabilities
+  ;;                   :supportsTerminateRequest))
+  ;;   (dape-request dape--debugger
+  ;;                 "terminate"
+  ;;                 nil
+  ;;                 (dape--callback
+  ;;                  (dape--kill-processes)
+  ;;                  (when cb
+  ;;                    (funcall cb nil)))))
+  ;;  ((dape--live-process t)
+  ;;   (dape-request dape--debugger
+  ;;                 "disconnect"
+  ;;                 `(:restart nil .
+  ;;                            ,(when (plist-get dape--capabilities
+  ;;                                              :supportTerminateDebuggee)
+  ;;                               (list :terminateDebuggee t)))
+  ;;                 (dape--callback
+  ;;                  (dape--kill-processes)
+  ;;                  (when cb
+  ;;                    (funcall cb nil)))))
+  ;;  (t
+  ;;   (dape--kill-processes)
+  ;;   (when cb
+  ;;     (funcall cb nil))))
+  )
 
 (defun dape-disconnect-quit ()
   "Kill adapter but try to keep debuggee live.
@@ -1470,23 +1543,15 @@ Executes alist key `launch' in `dape-configs' with :program as \"bin\".
 
 Use SKIP-COMPILE to skip compilation."
   (interactive (list (dape--read-config)))
-  (let ((fn
-         (dape--callback
-          (unless (plist-get config 'start-debugging)
-            (when-let ((buffer (get-buffer "*dape-debug*")))
-              (with-current-buffer buffer
-                (let ((inhibit-read-only t))
-                  (erase-buffer)))))
-          (cond
-           ((and (not skip-compile) (plist-get config 'compile))
-            (dape--compile config))
-           ((plist-get config 'port)
-            (dape--start-multi-session config))
-           (t
-            (dape--start-single-session config))))))
-    (if (plist-get config 'start-debugging)
-        (funcall fn)
-      (dape-kill fn))))
+  (when dape--debugger
+    (user-error "Previous debugging session failed to cleanup, run `dape-quit'."))
+  (cond
+   ((and (not skip-compile) (plist-get config 'compile))
+    (dape--compile config))
+   ((plist-get config 'port)
+    (dape--start-multi-session config))
+   (t
+    (dape--start-single-session config))))
 
 
 ;;; Compile
