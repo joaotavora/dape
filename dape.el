@@ -1419,12 +1419,13 @@ Starts a new process as per request of the debug adapter."
             (method ; a request
              (list :type "request"
                    :seq (+ (setq last-id id) n-sent-notifs)
+                   :request_seq last-id
                    :command method
                    :arguments params))))))
 
 (cl-defmethod jsonrpc-convert-to-jsonrpc ((bugger dape-dap-debugger) dap-message)
   (cl-destructuring-bind (&key type request_seq ((:seq _seq)) command arguments
-                               event body success message)
+                               event body success message &allow-other-keys)
       dap-message
     (with-slots (last-id n-sent-notifs) bugger
       (cond ((eq type :event) ; a notification from the dap server
@@ -1434,7 +1435,8 @@ Starts a new process as per request of the debug adapter."
             ((eq success :json-false) ; an error response from the dap server
              (list :jsonrpc "2.0 "
                    :id request_seq
-                   :error (or (plist-get body :error) message)))
+                   :error (list :code 32600
+                                :message (or (plist-get body :error) message))))
             ((eq success t) ; a successful response from the dap server
              (list :jsonrpc "2.0 "
                    :id request_seq
