@@ -893,9 +893,14 @@ See `dape--callback' for expected function signature."
   (jsonrpc-async-request bugger command arguments
                          :success-fn cb))
 
-(defun dape--initialize (process)
-  "Send initialize request to PROCESS."
-  (dape-async-request process
+(defun dape-request (bugger command arguments)
+  "Request COMMAND to BUGGER with ARGUMENTS, return result."
+  (jsonrpc-request bugger command arguments))
+
+(defun dape--initialize (bugger)
+  "Send initialize request to BUGGER"
+  (setq dape--capabilities
+        (dape-request bugger
                       "initialize"
                       (list :clientID "dape"
                             :adapterID (plist-get dape--config
@@ -914,31 +919,26 @@ See `dape--callback' for expected function signature."
                             :supportsProgressReporting t
                             :supportsStartDebuggingRequest t
                             ;;:supportsVariableType t
-                            )
-                      (dape--callback
-                       (setq dape--capabilities body)
-                       (when success
-                         (dape--launch-or-attach process)))))
+                            )))
+  (dape--launch-or-attach bugger))
 
-(defun dape--launch-or-attach (process)
+(defun dape--launch-or-attach (bugger)
   "Send launch or attach request to PROCESS.
 Uses `dape--config' to derive type and to construct request."
-  (let ((start-debugging (plist-get dape--config 'start-debugging)))
-    (dape-async-request process
-                        (or (plist-get dape--config :request) "launch")
-                        (append
-                         (cl-loop for (key value) on dape--config by 'cddr
-                                  when (keywordp key)
-                                  append (list key value))
-                         start-debugging)
-                        (dape--callback
-                         ;; nil start-debugging only if started as a part of
-                         ;; a start-debugging request
-                         (when start-debugging
-                           (plist-put dape--config 'start-debugging nil))
-                         (unless success
-                           (dape--repl-message msg 'dape-repl-exit-code-fail)
-                           (dape-kill))))))
+  (condition-case oops
+      (let ((start-debugging (plist-get dape--config 'start-debugging)))
+        (dape-request bugger
+                      (or (plist-get dape--config :request) "launch")
+                      (append
+                       (cl-loop for (key value) on dape--config by 'cddr
+                                when (keywordp key)
+                                append (list key value))
+                       start-debugging))
+        (when start-debugging
+          (plist-put dape--config 'start-debugging nil)))
+    (jsonrpc-error
+     (dape--repl-message oops 'dape-repl-exit-code-fail)
+     (dape-kill))))
 
 (defun dape--set-breakpoints (process buffer breakpoints &optional cb)
   "Set BREAKPOINTS in BUFFER by send setBreakpoints request to PROCESS.
@@ -2383,17 +2383,16 @@ REVERSED selects previous."
     map)
   "Keymap for `dape-info-parent-mode'.")
 
-(defun dape--info-buffer-change-fn (&rest _rest)
+(defun dape--info-buffer-change-fn (window)
   "Hook fn for `window-buffer-change-functions' to ensure updates."
-  (dape--info-buffer-update (current-buffer)))
+  (dape--info-buffer-update (window-buffer window)))
 
 (define-derived-mode dape-info-parent-mode special-mode ""
   "Generic mode to derive all other Dape gud buffer modes from."
   :interactive nil
   (setq-local buffer-read-only t
               cursor-in-non-selected-windows nil
-              dape--info-buffer-fetch-fn (lambda (cb)
-                                           (funcall cb)))
+              dape--info-buffer-fetch-fn #'funcall)
   (add-hook 'window-buffer-change-functions 'dape--info-buffer-change-fn
             nil 'local)
   (when dape-info-hide-mode-line
