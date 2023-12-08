@@ -743,20 +743,15 @@ On SKIP-PROCESS-BUFFERS skip deletion of buffers which has processes."
 \r?\n"
   "Matches debug adapter protocol header.")
 
-(defmacro dape--debug (type string &rest objects)
-  "Prints STRING of TYPE to *dape-debug*.
-See `format' for STRING and OBJECTS usage.
+(defun dape--debug (type fmt &rest args)
+  "Internal debugging util.
 See `dape-debug-on' for TYPE information."
-  `(when (memq ,type dape--debug-on)
-     (let ((objects (list ,@objects)))
-       (with-current-buffer (get-buffer-create "*dape-debug*")
-         (setq buffer-read-only t)
-         (goto-char (point-max))
-         (let ((inhibit-read-only t))
-           (insert (concat (propertize (format "[%s]" (symbol-name ,type)) 'face 'match)
-                           " "
-                           (apply 'format ,string objects))
-                   "\n"))))))
+  (when (and dape--debugger
+             (memq type dape--debug-on))
+    (jsonrpc--log-event dape--debugger
+                        (apply #'format
+                               (format "%s: %s" type fmt)
+                               args))))
 
 (defun dape--live-process (&optional nowarn)
   "Get current live process.
@@ -767,125 +762,8 @@ If NOWARN does not error on no active process."
     (unless nowarn
       (user-error "No debug process live"))))
 
-(defun dape--handle-object (process object)
-  "Handle a incoming parsed OBJECT from PROCESS."
-  (dape--debug 'io "Received:\n%S" object)
-  (when-let* ((type-string (plist-get object :type))
-              (type (intern type-string)))
-    (cl-case type
-      (response
-       (let ((seq (plist-get object :request_seq)))
-         (when-let ((timer (gethash seq dape--timers)))
-           (cancel-timer timer)
-           (remhash seq dape--timers))
-         (when-let ((cb (gethash seq dape--cb)))
-           (funcall cb
-                    process
-                    (plist-get object :body)
-                    (plist-get object :success)
-                    (plist-get object :message))
-           (remhash seq dape--cb))))
-      (request
-       (dape-handle-request process
-                            (intern (plist-get object :command))
-                            (plist-get object :seq)
-                            (plist-get object :arguments)))
-      (event
-       (let ((seq (plist-get object :seq)))
-         ;; netcoredbg sends seq as string for some reason
-         (when (stringp seq)
-           (setq seq (string-to-number seq)))
-         (cond
-          ;; FIXME This is only here for `godot' which keeps sending duplicate.
-          ((or (> seq dape--seq-event)
-               (zerop seq))
-           (setq dape--seq-event seq)
-           (dape-handle-event process
-                              (intern (plist-get object :event))
-                              (plist-get object :body)))
-          (t (dape--debug 'error
-                          "Event ignored due to request seq %d < last handled seq %d"
-                          seq dape--seq-event)))))
-      (_ (dape--debug 'info "No handler for type %s" type)))))
-
-(defun dape--debugger-filter (process string)
-  "Filter for Dape processes."
-  (when-let (((process-live-p process))
-             (input-buffer (process-buffer process))
-             (buffer (current-buffer)))
-    (with-current-buffer input-buffer
-      (goto-char (point-max))
-      (insert string)
-      (goto-char (point-min))
-      (let (expecting-more-bytes start)
-        (while (and (setq start (point))
-                    (search-forward "Content-Length: " nil t)
-                    (goto-char (match-beginning 0))
-                    (search-forward-regexp dape--content-length-re
-                                           (+ (point) 1000) t))
-          ;; Server non dap output?
-          (unless (equal start (match-beginning 0))
-            (dape--debug 'std-server "%s"
-                         (buffer-substring start (match-beginning 0))))
-          (let ((content-length (string-to-number (match-string 1))))
-            (if-let* ((expected-end
-                       (byte-to-position
-                        (+ content-length (position-bytes (point)))))
-                      (object
-                       (condition-case nil
-                           (json-parse-buffer :object-type 'plist
-                                              :null-object nil
-                                              :false-object nil)
-                         (error
-                          (and
-                           (dape--debug 'error
-                                        "Failed to parse json from `%s`"
-                                        (buffer-substring (point) expected-end))
-                           nil)))))
-                (with-current-buffer buffer
-                  (setq expecting-more-bytes nil)
-                  (dape--handle-object process object))
-              (dape--debug 'info "Need more bytes")
-              (setq expecting-more-bytes t))))
-        (when expecting-more-bytes
-          (goto-char (point-min))))
-      ;; This seams like we are living a bit dangerous. If input buffer
-      ;; is killed we are going to erase some random buffer
-      (when (buffer-live-p input-buffer)
-        (delete-region (point-min) (point))))))
-
 
 ;;; Outgoing requests
-
-(defconst dape--timeout 5
-  "Time before dape starts to complain about missing responses.")
-
-(defun dape--create-timer (process seq)
-  "Create SEQ request timeout timer for PROCESS."
-  (puthash seq
-           (run-with-timer dape--timeout
-                           nil
-                           (dape--callback
-                            (dape--debug 'error
-                                         "Timeout for reached for seq %d"
-                                         seq)
-                            (when (dape--live-process t)
-                              (dape--update-state "timed out"))
-                            (remhash seq dape--timers)
-                            (when-let ((cb (gethash seq dape--cb)))
-                              (remhash seq dape--cb)
-                              (funcall cb process nil nil nil)))
-                           process)
-           dape--timers))
-
-(defun dape-send-object (process &optional seq object)
-  "Helper for `dape-async-request' to send SEQ request with OBJECT to PROCESS."
-  (let* ((object (if seq (plist-put object :seq seq) object))
-         (json (json-serialize object :false-object nil))
-         (string (format "Content-Length: %d\r\n\r\n%s" (length json) json)))
-    (dape--debug 'io "Sending:\n%S" object)
-    (process-send-string process string)))
-
 (defun dape-async-request (bugger command arguments &optional cb)
   "Send request COMMAND to PROCESS with ARGUMENTS.
 If CB set, invoke CB on response.
@@ -1230,25 +1108,13 @@ is usefully if only to load data for another thread."
 
 ;;; Incoming requests
 
-(defun dape--response (process command seq success &optional body)
-  "Send request response for COMMAND for SEQ with SUCCESS and BODY.
-Adapter is identified with PROCESS."
-  (dape-send-object process
-                    nil
-                    (append (list :type "response"
-                                  :request_seq seq
-                                  :success success
-                                  :command command)
-                            (when body
-                              (list :body body)))))
-
 (cl-defgeneric dape-handle-request (_process command _seq arguments)
   "Sink for all unsupported requests."
   (dape--debug 'info "Unhandled request '%S' with arguments %S"
                command
                arguments))
 
-(cl-defmethod dape-handle-request (process (command (eql runInTerminal)) seq arguments)
+(cl-defmethod dape-handle-request (process (command (eql runInTerminal)) arguments)
   "Handle runInTerminal requests.
 Starts a new process to run process to be debugged."
   (let* ((cwd (plist-get process :cwd))
@@ -1267,13 +1133,12 @@ Starts a new process to run process to be debugged."
                          buffer
                          buffer)
     (dape--display-buffer buffer))
-  (dape--response process (symbol-name command) seq t))
+  )
 
-(cl-defmethod dape-handle-request (process (command (eql startDebugging)) seq arguments)
+(cl-defmethod dape-handle-request (process (command (eql startDebugging)) arguments)
   "Handle startDebugging requests.
 Starts a new process as per request of the debug adapter."
-  (dape--response process (symbol-name command) seq t)
-  (setq dape--parent-process dape--debugger)
+    (setq dape--parent-process dape--debugger)
   ;; js-vscode leaves launch request un-answered
   (when (hash-table-p dape--timers)
     (dolist (timer (hash-table-values dape--timers))
