@@ -738,10 +738,9 @@ On SKIP-PROCESS-BUFFERS skip deletion of buffers which has processes."
 See `dape-debug-on' for TYPE information."
   (when (memq type dape--debug-on)
     (when dape--debugger
-      (jsonrpc--log-event dape--debugger
-                          (apply #'format
-                                 (format "%s: %s" type fmt)
-                                 args)))
+      (jsonrpc--debug dape--debugger
+                      (format "%s: %s" type fmt)
+                      args))
     (apply #'message (format "%s: %s" type fmt) args)))
 
 (defun dape--live-process (&optional nowarn)
@@ -762,52 +761,50 @@ See `dape--callback' for expected function signature."
   (jsonrpc-async-request bugger command arguments
                          :success-fn cb))
 
-(defun dape-request (bugger command arguments)
-  "Request COMMAND to BUGGER with ARGUMENTS, return result."
-  (jsonrpc-request bugger command arguments))
-
 (defun dape--initialize (bugger)
   "Send initialize request to BUGGER"
   (setq dape--capabilities
-        (dape-request bugger
-                      "initialize"
-                      (list :clientID "dape"
-                            :adapterID (plist-get dape--config
-                                                  :type)
-                            :pathFormat "path"
-                            :linesStartAt1 t
-                            :columnsStartAt1 t
-                            ;;:locale "en-US"
-                            ;;:supportsVariableType t
-                            ;;:supportsVariablePaging t
-                            :supportsRunInTerminalRequest t
-                            ;;:supportsMemoryReferences t
-                            ;;:supportsInvalidatedEvent t
-                            ;;:supportsMemoryEvent t
-                            ;;:supportsArgsCanBeInterpretedByShell t
-                            :supportsProgressReporting t
-                            :supportsStartDebuggingRequest t
-                            ;;:supportsVariableType t
-                            )))
+        (jsonrpc-request bugger
+                         "initialize"
+                         (list :clientID "dape"
+                               :adapterID (plist-get dape--config
+                                                     :type)
+                               :pathFormat "path"
+                               :linesStartAt1 t
+                               :columnsStartAt1 t
+                               ;;:locale "en-US"
+                               ;;:supportsVariableType t
+                               ;;:supportsVariablePaging t
+                               :supportsRunInTerminalRequest t
+                               ;;:supportsMemoryReferences t
+                               ;;:supportsInvalidatedEvent t
+                               ;;:supportsMemoryEvent t
+                               ;;:supportsArgsCanBeInterpretedByShell t
+                               :supportsProgressReporting t
+                               :supportsStartDebuggingRequest t
+                               ;;:supportsVariableType t
+                               )))
   (dape--launch-or-attach bugger))
 
 (defun dape--launch-or-attach (bugger)
   "Send launch or attach request to PROCESS.
 Uses `dape--config' to derive type and to construct request."
-  (condition-case oops
-      (let ((start-debugging (plist-get dape--config 'start-debugging)))
-        (dape-request bugger
-                      (or (plist-get dape--config :request) "launch")
-                      (append
-                       (cl-loop for (key value) on dape--config by 'cddr
-                                when (keywordp key)
-                                append (list key value))
-                       start-debugging))
-        (when start-debugging
-          (plist-put dape--config 'start-debugging nil)))
-    (jsonrpc-error
-     (dape--repl-message oops 'dape-repl-exit-code-fail)
-     (dape-kill))))
+  (let ((start-debugging (plist-get dape--config 'start-debugging)))
+    (jsonrpc-request bugger
+                     (or (plist-get dape--config :request) "launch")
+                     (append
+                      (cl-loop for (key value) on dape--config by 'cddr
+                               when (keywordp key)
+                               append (list key value))
+                      start-debugging))
+    (when start-debugging
+      (plist-put dape--config 'start-debugging nil)))
+  ;; (condition-case oops
+  
+  ;;   (jsonrpc-error
+  ;;    (dape--repl-message oops 'dape-repl-exit-code-fail)
+  ;;    (dape-kill)))
+  )
 
 (defun dape--set-breakpoints (process buffer breakpoints &optional cb)
   "Set BREAKPOINTS in BUFFER by send setBreakpoints request to PROCESS.
@@ -842,44 +839,37 @@ See `dape--callback' for expected CB signature."
                          :lines (apply 'vector lines))
                         cb)))
 
-(defun dape--set-main-breakpoints (process cb)
-  "Set the main function breakpoints in adapter PROCESS.
-The function names are derived from `dape-main-functions'.
-See `dape--callback' for expected CB signature."
+(defun dape--set-main-breakpoints (conn)
+  "Set the main function breakpoints in adapter CONN.
+The function names are derived from `dape-main-functions'."
   (if (plist-get dape--capabilities :supportsFunctionBreakpoints)
-      (dape-async-request process
-                          "setFunctionBreakpoints"
-                          (list
-                           :breakpoints
-                           (cl-map 'vector
-                                   (lambda (name)
-                                     (list :name name))
-                                   dape-main-functions))
-                          cb)
-    (funcall cb process)))
+      (jsonrpc-request conn
+                       "setFunctionBreakpoints"
+                       (list
+                        :breakpoints
+                        (cl-map 'vector
+                                (lambda (name)
+                                  (list :name name))
+                                dape-main-functions)))))
 
-(defun dape--set-exception-breakpoints (process cb)
-  "Set the exception breakpoints in adapter PROCESS.
-The exceptions are derived from `dape--exceptions'.
-See `dape--callback' for expected CB signature."
+(defun dape--set-exception-breakpoints (conn)
+  "Set the exception breakpoints in adapter CONN
+The exceptions are derived from `dape--exceptions'."
   (if dape--exceptions
-      (dape-async-request process
-                          "setExceptionBreakpoints"
-                          (list
-                           :filters
-                           (cl-map 'vector
-                                   (lambda (exception)
-                                     (plist-get exception :filter))
-                                   (seq-filter (lambda (exception)
-                                                 (plist-get exception :enabled))
-                                               dape--exceptions)))
-                          cb)
-    (funcall cb process)))
+      (jsonrpc-request conn
+                       "setExceptionBreakpoints"
+                       (list
+                        :filters
+                        (cl-map 'vector
+                                (lambda (exception)
+                                  (plist-get exception :filter))
+                                (seq-filter (lambda (exception)
+                                              (plist-get exception :enabled))
+                                            dape--exceptions))))))
 
-(defun dape--configure-exceptions (process cb)
-  "Configure exception breakpoints in adapter PROCESS.
-The exceptions are derived from `dape--exceptions'.
-See `dape--callback' for expected CB signature."
+(defun dape--configure-exceptions (conn)
+  "Configure exception breakpoints in adapter CONN.
+The exceptions are derived from `dape--exceptions'."
   (setq dape--exceptions
         (cl-map 'list
                 (lambda (exception)
@@ -898,63 +888,46 @@ See `dape--callback' for expected CB signature."
                                  (plist-get exception :default))))))
                 (plist-get dape--capabilities
                            :exceptionBreakpointFilters)))
-  (dape--set-exception-breakpoints process
-                                   (dape--callback
-                                    (run-hooks 'dape-update-ui-hooks)
-                                    (funcall cb process))))
+  (dape--set-exception-breakpoints conn)
+  (run-hooks 'dape-update-ui-hooks))
 
-(defun dape--configure-breakpoints (process cb)
-  "Configure breakpoints in adapter PROCESS.
-See `dape--callback' for expected CB signature."
+(defun dape--configure-breakpoints (conn)
+  "Configure breakpoints in adapter CONN"
   (dape--clean-breakpoints)
-  (if-let ((counter 0)
-           (buffers-breakpoints (seq-group-by 'overlay-buffer
+  (if-let ((buffers-breakpoints (seq-group-by 'overlay-buffer
                                               dape--breakpoints)))
       (dolist (buffer-breakpoints buffers-breakpoints)
         (pcase-let ((`(,buffer . ,breakpoints) buffer-breakpoints))
-          (dape--set-breakpoints process
-                                 buffer
-                                 breakpoints
-                                 (dape--callback
-                                  (setf counter (1+ counter))
-                                  (when (eq counter (length buffers-breakpoints))
-                                    (funcall cb process nil))))))
-    (dape--set-main-breakpoints process cb)))
+          (dape--set-breakpoints conn buffer breakpoints)))
+    (dape--set-main-breakpoints conn)))
 
-(defun dape--configuration-done (process)
-  "End initialization of adapter PROCESS."
-  (dape-async-request process
-                      "configurationDone"
-                      nil
-                      (dape--callback nil)))
+(defun dape--configuration-done (conn)
+  "End initialization of adapter CONN"
+  (jsonrpc-request conn "configurationDone" nil))
 
-(defun dape--get-threads (process stopped-id all-threads-stopped cb)
+(defun dape--get-threads (process stopped-id all-threads-stopped)
   "Helper for the stopped event to update `dape--threads'."
-  (dape-async-request process
-                      "threads"
-                      nil
-                      (dape--callback
-                       (setq dape--threads
-                             (cl-map
-                              'list
-                              (lambda (new-thread)
-                                (let ((thread
-                                       (or (seq-find
-                                            (lambda (old-thread)
-                                              (eq (plist-get new-thread :id)
-                                                  (plist-get old-thread :id)))
-                                            dape--threads)
-                                           new-thread)))
-                                  (plist-put thread :name
-                                             (plist-get new-thread :name))
-                                  (cond
-                                   (all-threads-stopped
-                                    (plist-put thread :status "stopped"))
-                                   ((eq (plist-get thread :id) stopped-id)
-                                    (plist-put thread :status "stopped"))
-                                   (t thread))))
-                              (plist-get body :threads)))
-                       (funcall cb process))))
+  (setq dape--threads
+        (cl-map
+         'list
+         (lambda (new-thread)
+           (let ((thread
+                  (or (seq-find
+                       (lambda (old-thread)
+                         (eq (plist-get new-thread :id)
+                             (plist-get old-thread :id)))
+                       dape--threads)
+                      new-thread)))
+             (plist-put thread :name
+                        (plist-get new-thread :name))
+             (cond
+              (all-threads-stopped
+               (plist-put thread :status "stopped"))
+              ((eq (plist-get thread :id) stopped-id)
+               (plist-put thread :status "stopped"))
+              (t thread))))
+         (plist-get (jsonrpc-request process "threads" nil)
+                    :threads))))
 
 (defun dape--stack-trace (process thread cb)
   "Update the stack trace in THREAD plist by adapter PROCESS.
@@ -1105,38 +1078,34 @@ is usefully if only to load data for another thread."
                command
                arguments))
 
-(cl-defmethod dape-handle-request (process (command (eql runInTerminal)) arguments)
+(cl-defmethod dape-handle-request (_conn (_command (eql runInTerminal))
+                                         &key args cwd &allow-other-keys)
   "Handle runInTerminal requests.
 Starts a new process to run process to be debugged."
-  (let* ((cwd (plist-get process :cwd))
-         (default-directory (or (and cwd
-                                     (not (string-blank-p cwd))
-                                     cwd)
+  (let* ((default-directory (or (and cwd (not (string-blank-p cwd)) cwd)
                                 default-directory))
          (buffer (get-buffer-create "*dape-shell*"))
          (display-buffer-alist
           '(((major-mode . shell-mode) . (display-buffer-no-window)))))
     (async-shell-command (string-join
-                          (cl-map 'list
-                                  'identity
-                                  (plist-get arguments :args))
+                          (cl-map 'list 'identity args)
                           " ")
                          buffer
                          buffer)
-    (dape--display-buffer buffer))
-  )
+    (dape--display-buffer buffer)
+    t))
 
-(cl-defmethod dape-handle-request (process (command (eql startDebugging)) arguments)
-  "Handle startDebugging requests.
-Starts a new process as per request of the debug adapter."
-    (setq dape--parent-process dape--debugger)
-  ;; js-vscode leaves launch request un-answered
-  (when (hash-table-p dape--timers)
-    (dolist (timer (hash-table-values dape--timers))
-      (cancel-timer timer)))
-  (dape (plist-put dape--config
-                   'start-debugging
-                   (plist-get arguments :configuration))))
+;; (cl-defmethod dape-handle-request (_conn (_command (eql startDebugging)) arguments)
+;;   "Handle startDebugging requests.
+;; Starts a new process as per request of the debug adapter."
+;;     (setq dape--parent-process dape--debugger)
+;;   ;; js-vscode leaves launch request un-answered
+;;   (when (hash-table-p dape--timers)
+;;     (dolist (timer (hash-table-values dape--timers))
+;;       (cancel-timer timer)))
+;;   (dape (plist-put dape--config
+;;                    'start-debugging
+;;                    (plist-get arguments :configuration))))
 
 
 ;;; Events
@@ -1145,66 +1114,63 @@ Starts a new process as per request of the debug adapter."
   "Sink for all unsupported events."
   (dape--debug 'info "Unhandled event '%S' with body %S" event body))
 
-(cl-defmethod dape-handle-event (process (_event (eql initialized)) _body)
+(cl-defmethod dape-handle-event (conn (_event (eql initialized)) &allow-other-keys)
   "Handle initialized events."
   (dape--update-state "initialized")
-  (dape--with dape--configure-exceptions (process)
-    (dape--with dape--configure-breakpoints (process)
-      (dape--configuration-done process))))
+  (dape--configure-exceptions conn)
+  (dape--configure-breakpoints conn)
+  (dape--configuration-done conn))
 
-(cl-defmethod dape-handle-event (process (_event (eql capabilities)) body)
+(cl-defmethod dape-handle-event (conn (_event (eql capabilities))
+                                      &key capabilities
+                                      &allow-other-keys)
   "Handle capabilities events."
-  (setq dape--capabilities (plist-get body :capabilities))
+  (setq dape--capabilities capabilities)
   (dape--debug 'info "Capabailities recived")
-  (dape--configure-exceptions process (dape--callback nil)))
+  (dape--configure-exceptions conn))
 
-(cl-defmethod dape-handle-event (_process (_event (eql process)) body)
+(cl-defmethod dape-handle-event (_conn (_event (eql process))
+                                       &key startMethod name
+                                       &allow-other-keys)
   "Handle process events."
-  (let ((start-method (format "%sed"
-                              (or (plist-get body :startMethod)
-                                  "start"))))
+  (let ((start-method (format "%sed" (or startMethod "start"))))
     (dape--update-state start-method)
-    (dape--repl-message (format "Process %s %s"
-                                start-method
-                                (plist-get body :name)))))
+    (dape--repl-message (format "Process %s %s" start-method name))))
 
-(cl-defmethod dape-handle-event (_process (_event (eql thread)) body)
+(cl-defmethod dape-handle-event (_conn (_event (eql thread))
+                                       &key threadId reason
+                                       &allow-other-keys)
   "Handle thread events."
   (if-let ((thread
             (seq-find (lambda (thread)
-                        (eq (plist-get thread :id)
-                            (plist-get body :threadId)))
+                        (eq (plist-get thread :id) threadId))
                       dape--threads)))
       (progn
-        (plist-put thread :status (plist-get body :reason))
+        (plist-put thread :status reason)
         (plist-put thread :name (or (plist-get thread :name)
                                     "unnamed")))
     ;; If new thread use thread state as global state
-    (dape--update-state (plist-get body :reason))
-    (push (list :status (plist-get body :reason)
-                :id (plist-get body :threadId)
-                :name "unnamed")
-          dape--threads))
+    (dape--update-state reason)
+    (push (list :status reason :id threadId :name "unnamed") dape--threads))
   (run-hooks 'dape-update-ui-hooks))
 
-(cl-defmethod dape-handle-event (process (_event (eql stopped)) body)
+(cl-defmethod dape-handle-event (conn (_event (eql stopped))
+                                      &key threadId allThreadsStopped
+                                      text description reason
+                                      &allow-other-keys)
   "Handle stopped events."
   (dape--update-state "stopped")
-  (setq dape--thread-id (plist-get body :threadId))
-  (dape--get-threads process
-                     (plist-get body :threadId)
-                     (plist-get body :allThreadsStopped)
-                     (dape--callback
-                      (dape--update process)))
+  (setq dape--thread-id threadId)
+  (dape--get-threads conn threadId allThreadsStopped)
+  (dape--update conn)
   (when-let ((texts (seq-filter 'stringp
-                                (list (plist-get body :text)
-                                      (plist-get body :description)))))
+                                (list text description))))
     (dape--repl-message (mapconcat 'identity texts "\n")
-                        (when (equal "exception"
-                                     (plist-get body :reason))
+                        (when (equal "exception" reason)
                           'error))))
 
-(cl-defmethod dape-handle-event (_process (_event (eql continued)) body)
+(cl-defmethod dape-handle-event (_conn (_event (eql continued))
+                                       body)
   "Handle continued events."
   (dape--update-state "running")
   (dape--remove-stack-pointers)
@@ -1247,17 +1213,19 @@ Starts a new process as per request of the debug adapter."
     :initform 0
     :documentation "Used for converting JSONRPC id numbers to DAP seq numbers." )
    (kill-inferior-on-exit
-    :initform (error "required!")
+    :initform nil
     :initarg :kill-inferior-on-exit))
   :documentation
   "Represents a DAP debugger. Wraps a process for DAP communication.")
 
 (cl-defmethod jsonrpc-convert-from-jsonrpc ((bugger dape-dap-debugger) message)
-  (cl-destructuring-bind (&key method id error params result _jsonrpc) message
+  (cl-destructuring-bind (&key method id error params
+                               (result nil result-supplied-p)
+                               _jsonrpc) message
     (with-slots (last-id n-sent-notifs) bugger
       (cond ((null id) ; a notification to the dap server
              (cl-incf n-sent-notifs)
-             (list :type :event
+             (list :type "event"
                    :seq (+ last-id n-sent-notifs)
                    :event method
                    :body params))
@@ -1268,12 +1236,12 @@ Starts a new process as per request of the debug adapter."
                    :success :json-false
                    :message (plist-get error :message)
                    :body (plist-get error :data)))
-            (result ; a success response to the dap server
-             (list :type "response"
-                   :seq (+ (setq last-id id) n-sent-notifs)
-                   :request_seq last-id
-                   :success t
-                   :body result))
+            (result-supplied-p ; a success response to the dap server
+             (cl-list* :type "response"
+                       :seq (+ (setq last-id id) n-sent-notifs)
+                       :request_seq last-id
+                       :success t
+                       (and result `(:body ,result))))
             (method ; a request
              (list :type "request"
                    :seq (+ (setq last-id id) n-sent-notifs)
@@ -1282,26 +1250,26 @@ Starts a new process as per request of the debug adapter."
                    :arguments params))))))
 
 (cl-defmethod jsonrpc-convert-to-jsonrpc ((bugger dape-dap-debugger) dap-message)
-  (cl-destructuring-bind (&key type request_seq ((:seq _seq)) command arguments
+  (cl-destructuring-bind (&key type request_seq seq command arguments
                                event body success message &allow-other-keys)
       dap-message
     (with-slots (last-id n-sent-notifs) bugger
-      (cond ((eq type :event) ; a notification from the dap server
-             (list :jsonrpc "2.0 "
+      (cond ((string= type "event") ; a notification from the dap server
+             (list :jsonrpc "2.0"
                    :method event
                    :params body))
             ((eq success :json-false) ; an error response from the dap server
-             (list :jsonrpc "2.0 "
-                   :id request_seq
+             (list :jsonrpc "2.0"
+                   :id (or request_seq seq)
                    :error (list :code 32600
                                 :message (or (plist-get body :error) message))))
             ((eq success t) ; a successful response from the dap server
-             (list :jsonrpc "2.0 "
-                   :id request_seq
+             (list :jsonrpc "2.0"
+                   :id (or request_seq seq)
                    :result body))
             (command ; a request from the dap server
-             (list :jsonrpc "2.0 "
-                   :id request_seq
+             (list :jsonrpc "2.0"
+                   :id (or request_seq seq)
                    :method command
                    :params arguments))))))
 
@@ -1388,24 +1356,18 @@ Starts a new process as per request of the debug adapter."
     (dape--setup (make-instance
                   'dape-dap-debugger
                   :name "DAPEDOPE"
-                  :request-dispatcher nil
-                  :notification-dispatcher nil
-                  :events-buffer-scrollback-size nil
                   :kill-inferior-on-exit (not on-behalf-p)
+                  :request-dispatcher (lambda (conn method args)
+                                        (apply #'dape-handle-request conn method args))
                   :on-shutdown (lambda (bugger)
                                  (setq dape--config nil)
                                  (dape--remove-stack-pointers)
                                  ;; (dape--variable-remove-overlays)
                                  (jsonrpc--debug bugger "network process byebye")
                                  (when (slot-value bugger 'kill-inferior-on-exit)
-                                   (trace-values "killing inferior!" dape--inferior-process)
                                    (kill-process dape--inferior-process))
                                  (setq dape--debugger nil)
-                                 (force-mode-line-update t)
-
-                                 ;; unless this `dape-dap-debugger'
-                                 ;; thingy
-                                 )
+                                 (force-mode-line-update t))
                   :process network-process)
 
 
@@ -2485,7 +2447,7 @@ FN is executed on mouse-2 and ?r, BODY is executed inside of let stmt."
   (plist-put dape--info-exception :enabled
              (not (plist-get dape--info-exception :enabled)))
   (dape-info-update)
-  (dape--with dape--set-exception-breakpoints ((dape--live-process))))
+  (dape--set-exception-breakpoints (dape--live-process)))
 
 (dape--info-buffer-map dape-info-exceptions-line-map dape-info-exceptions-toggle)
 
