@@ -440,7 +440,7 @@ The hook is run with one argument, the compilation buffer."
   "List of available exceptions as plists.")
 (defvar dape--watched nil
   "List of watched expressions.")
-(defvar dape--server-process nil
+(defvar dape--inferior-process nil
   "Debug adapter server process.")
 ;; FIXME: Shouldn't this be "debugging-session local"? OK for now.
 (defvar dape--debugger nil
@@ -676,8 +676,8 @@ If EXTENDED end of line is after newline."
       (cancel-timer timer)))
   (and dape--debugger
        (jsonrpc-shutdown dape--debugger))
-  (and dape--server-process
-       (delete-process dape--server-process))
+  (and dape--inferior-process
+       (delete-process dape--inferior-process))
   (and dape--parent-process
        (delete-process dape--parent-process)))
 
@@ -733,25 +733,16 @@ On SKIP-PROCESS-BUFFERS skip deletion of buffers which has processes."
 
 ;;; Process and parsing
 
-;; HACK Issue #1 for some reason \r is not inserted into the parse
-;;      buffer by codelldb on windows. No trace in source code.
-
-;; Some adapters can't help them self, sending headers not in spec..
-(defconst dape--content-length-re
-  "Content-Length: \\([[:digit:]]+\\)\r?\n\
-\\(?:.*: .*\r?\n\\)*\
-\r?\n"
-  "Matches debug adapter protocol header.")
-
 (defun dape--debug (type fmt &rest args)
   "Internal debugging util.
 See `dape-debug-on' for TYPE information."
-  (when (and dape--debugger
-             (memq type dape--debug-on))
-    (jsonrpc--log-event dape--debugger
-                        (apply #'format
-                               (format "%s: %s" type fmt)
-                               args))))
+  (when (memq type dape--debug-on)
+    (when dape--debugger
+      (jsonrpc--log-event dape--debugger
+                          (apply #'format
+                                 (format "%s: %s" type fmt)
+                                 args)))
+    (apply #'message (format "%s: %s" type fmt) args)))
 
 (defun dape--live-process (&optional nowarn)
   "Get current live process.
@@ -1255,7 +1246,9 @@ Starts a new process as per request of the debug adapter."
    (n-sent-notifs
     :initform 0
     :documentation "Used for converting JSONRPC id numbers to DAP seq numbers." )
-   )
+   (kill-inferior-on-exit
+    :initform (error "required!")
+    :initarg :kill-inferior-on-exit))
   :documentation
   "Represents a DAP debugger. Wraps a process for DAP communication.")
 
@@ -1350,53 +1343,40 @@ Starts a new process as per request of the debug adapter."
         (default-directory (or (plist-get config 'command-cwd)
                                default-directory))
         (host (or (plist-get config 'host) "localhost"))
-        (retries 30)
-        command debugger)
+        (on-behalf-p (plist-get config 'start-debugging))
+        command
+        (retries 30) network-process)
     (when (and (plist-get config 'command)
-               (not (plist-get config 'start-debugging)))
+               (not on-behalf-p))
       (setq
        command (cons (plist-get config 'command)
                      (cl-map 'list 'identity
                              (plist-get config 'command-args)))
-       dape--server-process
+       dape--inferior-process
        (make-process :name "Dape adapter"
                      :command command
                      :buffer buffer
                      :sentinel (lambda (p _msg)
-                                 (when dape--debugger
-                                   (jsonrpc--debug dape--debugger "\nProcess %S exited with %d"
-                                                   (process-command p)
-                                                   (process-exit-status p))))
+                                 (dape--debug 'info
+                                              "Inferior process %S exited with %d"
+                                              (process-command p)
+                                              (process-exit-status p)))
                      :filter (lambda (_process string)
                                (dape--debug 'std-server
                                             "Server stdout:\n%s"
                                             string))
                      :noquery t))
-      (dape--debug 'info "Server process started %S" command))
-    (while (and (not debugger)
-                (> retries 0))
+      (dape--debug 'info "Inferior process started %S" command))
+    (while (and (not network-process) (> retries 0))
       (ignore-errors
-        (setq debugger
-              (make-instance
-               'dape-dap-debugger
-               :name "DAPEDOPE"
-               :request-dispatcher nil
-               :notification-dispatcher nil
-               :events-buffer-scrollback-size nil
-               :on-shutdown (lambda (bugger)
-                              (setq dape--config nil)
-                              (dape--remove-stack-pointers)
-                              ;; (dape--variable-remove-overlays)
-                              (jsonrpc--debug bugger "network process byebye")
-                              (setq dape--debugger nil)
-                              (force-mode-line-update t))
-               :process (make-network-process
+        (setq network-process
+              (make-network-process
                          :name "Dape adapter connection"
                          :buffer buffer
                          :host host
                          :coding 'utf-8-emacs-unix
                          :service (plist-get config 'port)
-                         :noquery t))))
+                         :noquery t)))
       (sleep-for 0.1)
       (setq retries (1- retries)))
     (if (zerop retries)
@@ -1405,7 +1385,31 @@ Starts a new process as per request of the debug adapter."
                     (plist-get config 'port))
       (dape--debug 'info "Connection to server established %s:%s"
                    host (plist-get config 'port)))
-    (dape--setup debugger config)))
+    (dape--setup (make-instance
+                  'dape-dap-debugger
+                  :name "DAPEDOPE"
+                  :request-dispatcher nil
+                  :notification-dispatcher nil
+                  :events-buffer-scrollback-size nil
+                  :kill-inferior-on-exit (not on-behalf-p)
+                  :on-shutdown (lambda (bugger)
+                                 (setq dape--config nil)
+                                 (dape--remove-stack-pointers)
+                                 ;; (dape--variable-remove-overlays)
+                                 (jsonrpc--debug bugger "network process byebye")
+                                 (when (slot-value bugger 'kill-inferior-on-exit)
+                                   (trace-values "killing inferior!" dape--inferior-process)
+                                   (kill-process dape--inferior-process))
+                                 (setq dape--debugger nil)
+                                 (force-mode-line-update t)
+
+                                 ;; unless this `dape-dap-debugger'
+                                 ;; thingy
+                                 )
+                  :process network-process)
+
+
+                 config)))
 
 (defun dape--start-single-session (config)
   "Start single session for CONFIG."
