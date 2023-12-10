@@ -736,10 +736,10 @@ If NOWARN does not error on no active process."
 
 
 ;;; Outgoing requests
-(defun dape--initialize (bugger)
-  "Send initialize request to BUGGER"
+(defun dape--initialize (conn)
+  "Send initialize request to CONN"
   (setq dape--capabilities
-        (jsonrpc-request bugger
+        (jsonrpc-request conn
                          "initialize"
                          (list :clientID "dape"
                                :adapterID (plist-get dape--config
@@ -759,13 +759,13 @@ If NOWARN does not error on no active process."
                                :supportsStartDebuggingRequest t
                                ;;:supportsVariableType t
                                )))
-  (dape--launch-or-attach bugger))
+  (dape--launch-or-attach conn))
 
-(defun dape--launch-or-attach (bugger)
-  "Send launch or attach request to PROCESS.
+(defun dape--launch-or-attach (conn)
+  "Send launch or attach request to CONN.
 Uses `dape--config' to derive type and to construct request."
   (let ((start-debugging (plist-get dape--config 'start-debugging)))
-    (jsonrpc-request bugger
+    (jsonrpc-request conn
                      (or (plist-get dape--config :request) "launch")
                      (append
                       (cl-loop for (key value) on dape--config by 'cddr
@@ -1157,11 +1157,12 @@ Starts a new process to run process to be debugged."
   :documentation
   "Represents a DAP debugger. Wraps a process for DAP communication.")
 
-(cl-defmethod jsonrpc-convert-from-jsonrpc ((bugger dape-dap-debugger) message)
+(cl-defmethod jsonrpc-convert-from-jsonrpc ((conn dape-dap-debugger) message)
   (cl-destructuring-bind (&key method id error params
                                (result nil result-supplied-p)
-                               _jsonrpc) message
-    (with-slots (last-id n-sent-notifs) bugger
+                               _jsonrpc)
+      message
+    (with-slots (last-id n-sent-notifs) conn
       (cond ((null id) ; a notification to the dap server
              (cl-incf n-sent-notifs)
              (list :type "event"
@@ -1188,11 +1189,11 @@ Starts a new process to run process to be debugged."
                    :command method
                    :arguments params))))))
 
-(cl-defmethod jsonrpc-convert-to-jsonrpc ((bugger dape-dap-debugger) dap-message)
+(cl-defmethod jsonrpc-convert-to-jsonrpc ((conn dape-dap-debugger) dap-message)
   (cl-destructuring-bind (&key type request_seq seq command arguments
                                event body success message &allow-other-keys)
       dap-message
-    (with-slots (last-id n-sent-notifs) bugger
+    (with-slots (last-id n-sent-notifs) conn
       (cond ((string= type "event") ; a notification from the dap server
              (list :jsonrpc "2.0"
                    :method event
@@ -1297,12 +1298,12 @@ Starts a new process to run process to be debugged."
                   :kill-inferior-on-exit (not on-behalf-p)
                   :request-dispatcher (lambda (conn method args)
                                         (apply #'dape-handle-request conn method args))
-                  :on-shutdown (lambda (bugger)
+                  :on-shutdown (lambda (conn)
                                  (setq dape--config nil)
                                  (dape--remove-stack-pointers)
                                  ;; (dape--variable-remove-overlays)
-                                 (jsonrpc--debug bugger "network process byebye")
-                                 (when (slot-value bugger 'kill-inferior-on-exit)
+                                 (jsonrpc--debug conn "network process byebye")
+                                 (when (slot-value conn 'kill-inferior-on-exit)
                                    (kill-process dape--inferior-process))
                                  (setq dape--debugger nil)
                                  (force-mode-line-update t))
@@ -1328,7 +1329,7 @@ Starts a new process to run process to be debugged."
            :request-dispatcher nil
            :notification-dispatcher nil
            :events-buffer-scrollback-size nil
-           :on-shutdown (lambda (_bugger)
+           :on-shutdown (lambda (_conn)
                           (with-current-buffer buffer
                             (setq dape--debugger nil)))
            :process (make-process :name "Dape adapter"
@@ -2126,7 +2127,7 @@ REVERSED selects previous."
   :interactive nil
   (setq-local buffer-read-only t
               cursor-in-non-selected-windows nil
-              dape--info-buffer-fetch-fn #'funcall)
+              dape--info-buffer-fetch-fn (lambda () (list)))
   (add-hook 'window-buffer-change-functions 'dape--info-buffer-change-fn
             nil 'local)
   (when dape-info-hide-mode-line
@@ -2193,9 +2194,10 @@ with ARGS."
 
 (defun dape--info-buffer-update (buffer)
   "Update dape info BUFFER."
-  (apply #'dape--info-buffer-update-1 buffer
-         (with-current-buffer buffer
-           (funcall dape--info-buffer-fetch-fn))))
+  (when-let ((args
+              (with-current-buffer buffer
+                (funcall dape--info-buffer-fetch-fn))))
+    (dape--info-buffer-update-1 buffer args)))
 
 (defun dape--info-get-live-buffer (mode &optional identifier)
   "Get live dape info buffer with MODE and IDENTIFIER."
