@@ -418,8 +418,6 @@ The hook is run with one argument, the compilation buffer."
   "Session seq number.")
 (defvar dape--seq-event nil
   "Session event seq number.")
-(defvar dape--cb nil
-  "Hash table of request callbacks.")
 (defvar dape--state nil
   "Session state string.")
 (defvar dape--thread-id nil
@@ -1224,7 +1222,6 @@ Starts a new process to run process to be debugged."
         dape--seq 0
         dape--seq-event 0
         dape--timers (make-hash-table)
-        dape--cb (make-hash-table)
         dape--thread-id nil
         dape--capabilities nil
         dape--threads nil
@@ -2196,10 +2193,9 @@ with ARGS."
 
 (defun dape--info-buffer-update (buffer)
   "Update dape info BUFFER."
-  (with-current-buffer buffer
-    (funcall dape--info-buffer-fetch-fn
-             (lambda (&rest args)
-               (dape--info-buffer-update-1 buffer args)))))
+  (apply #'dape--info-buffer-update-1 buffer
+         (with-current-buffer buffer
+           (funcall dape--info-buffer-fetch-fn))))
 
 (defun dape--info-get-live-buffer (mode &optional identifier)
   "Get live dape info buffer with MODE and IDENTIFIER."
@@ -2454,8 +2450,10 @@ FN is executed on mouse-2 and ?r, BODY is executed inside of let stmt."
 
 (defun dape--info-threads-fetch ()
   "Fetches data for `dape--info-threads-update'."
-  (when (dape--live-process t)
-    (dape--inactive-threads-stack-trace (dape--live-process))))
+  (cond ((dape--live-process t)
+         (dape--inactive-threads-stack-trace (dape--live-process))
+         (list (dape--current-stack-frame)))
+        (t (list nil))))
 
 (defun dape--info-threads-update (current-thread)
   "Updates `dape-info-threads-mode' buffer from CURRENT-THREAD."
@@ -2529,12 +2527,11 @@ FN is executed on mouse-2 and ?r, BODY is executed inside of let stmt."
         dape--info-buffer-related '((dape-info-stack-mode nil "Stack")))
   (add-to-list 'overlay-arrow-variable-list 'dape--info-stack-position))
 
-(defun dape--info-stack-fetch (cb)
-  "Fetches data for `dape--info-stack-update'.
-CB is expected to be `dape--info-stack-update'."
+(defun dape--info-stack-fetch ()
+  "Fetches data for `dape--info-stack-update'."
   (let ((stack-frames (plist-get (dape--current-thread) :stackFrames))
         (current-stack-frame (dape--current-stack-frame)))
-    (funcall cb current-stack-frame stack-frames)))
+    (list current-stack-frame stack-frames)))
 
 (defun dape--info-stack-update (current-stack-frame stack-frames)
   "Updates `dape-info-stack-mode' buffer.
@@ -2609,19 +2606,18 @@ Updates from CURRENT-STACK-FRAME STACK-FRAMES."
 (dape--info-buffer-command dape-info-variable-edit
   (dape--info-ref dape--info-variable)
   "Edit variable value at line in dape info buffer."
-  (dape--with dape--set-variable
-      ((dape--live-process)
-       dape--info-ref
-       dape--info-variable
-       (read-string
-        (format "Set value of %s `%s' = "
-                (plist-get dape--info-variable :type)
-                (plist-get dape--info-variable :name))
-        (or (plist-get dape--info-variable :value)
-            (plist-get dape--info-variable :result))))
-    (cond
-     (success (dape--update process))
-     (t (dape--repl-message msg)))))
+  (let ((conn (dape--live-process)))
+    (dape--set-variable
+     conn
+     dape--info-ref
+     dape--info-variable
+     (read-string
+      (format "Set value of %s `%s' = "
+              (plist-get dape--info-variable :type)
+              (plist-get dape--info-variable :name))
+      (or (plist-get dape--info-variable :value)
+          (plist-get dape--info-variable :result))))
+    (dape--update conn)))
 
 (dape--info-buffer-map dape-info-variable-value-map dape-info-variable-edit)
 
@@ -2726,24 +2722,20 @@ Updates from CURRENT-STACK-FRAME STACK-FRAMES."
                                        (plist-get object :variablesReference)
                                        path)))))
 
-(defun dape--info-scope-fetch (cb)
-  "Fetches data for `dape--info-scope-update'.
-CB is expected to be `dape--info-scope-update'."
-  (when-let* ((process (dape--live-process t))
+(defun dape--info-scope-fetch ()
+  "Fetches data for `dape--info-scope-update'."
+  (when-let* ((conn (dape--live-process t))
               (frame (dape--current-stack-frame))
               (scopes (plist-get frame :scopes))
               (scope (nth dape--info-buffer-identifier scopes)))
-    (dape--with dape--variables (process scope)
-      (dape--with dape--variables-recursive
-          (process
-           scope
-           (list (plist-get scope :name))
-           (lambda (path object)
-             (and (not (plist-get object :expensive))
-                  (gethash (cons (plist-get object :name) path)
-                           dape--info-expanded-p))))
-        (when (and scope scopes (equal dape--state "stopped"))
-          (funcall cb scope scopes))))))
+    (dape--variables conn scope)
+    (dape--variables-recursive conn scope (list (plist-get scope :name))
+                               (lambda (path object)
+                                 (and (not (plist-get object :expensive))
+                                      (gethash (cons (plist-get object :name) path)
+                                               dape--info-expanded-p))))
+    (when (equal dape--state "stopped")
+      (list scope scopes))))
 
 (defun dape--info-scope-update (scope scopes)
   "Updates `dape-info-scope-mode' buffer for SCOPE, SCOPES."
@@ -2771,35 +2763,28 @@ CB is expected to be `dape--info-scope-update'."
         dape--info-buffer-related '((dape-info-watch-mode nil "Watch"))
         truncate-lines t))
 
-(defun dape--info-watch-fetch (cb)
-  "Fetches data for `dape--info-watch-update'.
-CB is expected to be `dape--info-watch-update'."
+(defun dape--info-watch-fetch ()
+  "Fetches data for `dape--info-watch-update'."
   (when-let* ((process (dape--live-process t))
               (frame (dape--current-stack-frame))
-              (scopes (plist-get frame :scopes))
-              (responses 0))
-    (if (not dape--watched)
-        (funcall cb scopes)
-      (dolist (plist dape--watched)
-        (dape--with dape--evaluate-expression
-            ((dape--live-process t)
-             (plist-get frame :id)
-             (plist-get plist :name)
-             "watch")
-          (when success
-            (cl-loop for (key value) on body by 'cddr
-                     do (plist-put plist key value)))
-          (setq responses (1+ responses))
-          (when (length= dape--watched responses)
-            (dape--with dape--variables-recursive
-                (process
-                 (list :variables dape--watched)
-                 (list "Watch")
-                 (lambda (path object)
-                   (and (not (plist-get object :expensive))
-                        (gethash (cons (plist-get object :name) path)
-                                 dape--info-expanded-p))))
-              (funcall cb scopes))))))))
+              (scopes (plist-get frame :scopes)))
+    (dolist (plist dape--watched)
+      (let ((res
+             (dape--evaluate-expression (dape--live-process t)
+                                        (plist-get frame :id)
+                                        (plist-get plist :name)
+                                        "watch")))
+        (cl-loop for (key value) on res by 'cddr
+                 do (plist-put plist key value)))
+      (dape--variables-recursive
+       process
+       (list :variables dape--watched)
+       (list "Watch")
+       (lambda (path object)
+         (and (not (plist-get object :expensive))
+              (gethash (cons (plist-get object :name) path)
+                       dape--info-expanded-p))))
+      (list scopes))))
 
 (defun dape--info-watch-update (scopes)
   "Updates `dape-info-watch-mode' buffer for SCOPES."
@@ -3022,15 +3007,17 @@ On success calles CB with the doc string.
 See `eldoc-documentation-functions', for more infomation."
   (and-let* (((plist-get dape--capabilities :supportsEvaluateForHovers))
              (symbol (thing-at-point 'symbol)))
-    (dape--evaluate-expression (dape--live-process)
-                               (plist-get (dape--current-stack-frame) :id)
-                               (substring-no-properties symbol)
-                               "hover"
-                               (dape--callback
-                                (when success
-                                  (funcall cb
-                                           (dape--variable-string
-                                            (plist-put body :name symbol))))))
+    (jsonrpc-async-request
+     (dape--live-process)
+     "evaluate"
+     (append (when (dape--stopped-threads)
+               (list :frameId (plist-get (dape--current-stack-frame) :id)))
+             (list :expression (substring-no-properties symbol)
+                   :context "hover"))
+     :success-fn (lambda (body)
+                   (funcall cb
+                            (dape--variable-string
+                             (plist-put body :name symbol)))))
     t))
 
 (defun dape--add-eldoc-hook ()
@@ -3105,21 +3092,6 @@ See `eldoc-documentation-functions', for more infomation."
 
 
 ;;; Hooks
-
-;; Cleanup process before bed time
-(add-hook 'kill-emacs-hook
-          (defun dape-kill-busy-wait ()
-            (let (done)
-              (dape-kill
-               (dape--callback
-                (setq done t)))
-              ;; Busy wait for response at least 2 seconds
-              (cl-loop with max-iterations = 20
-                       for i from 1 to max-iterations
-                       until done
-                       do (accept-process-output nil 0.1)
-                       finally (unless done
-                                 (dape--kill-processes))))))
 
 (provide 'dape)
 
