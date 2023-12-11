@@ -925,9 +925,11 @@ The exceptions are derived from `dape--exceptions'."
     (unless (or (not (numberp variables-reference))
                 (zerop variables-reference)
                 (plist-get object :variables))
-      (let ((res (jsonrpc-request conn
-                                  "variables"
-                                  (list :variablesReference variables-reference))))
+      (when-let ((res
+                  (ignore-errors
+                    (jsonrpc-request conn
+                                     "variables"
+                                     (list :variablesReference variables-reference)))))
         (plist-put object
                    :variables
                    (thread-last (plist-get res :variables)
