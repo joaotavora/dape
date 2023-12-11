@@ -52,6 +52,7 @@
 (require 'tree-widget)
 (require 'project)
 (require 'gdb-mi)
+(require 'shell)
 
 
 ;;; Custom
@@ -1026,13 +1027,14 @@ Starts a new process to run process to be debugged."
          (buffer (get-buffer-create "*dape-shell*"))
          (display-buffer-alist
           '(((major-mode . shell-mode) . (display-buffer-no-window)))))
-    (async-shell-command (string-join
-                          (cl-map 'list 'identity args)
-                          " ")
-                         buffer
-                         buffer)
-    (dape--display-buffer buffer)
-    t))
+    (with-current-buffer buffer
+      (shell-mode)
+      (let ((p (make-process
+                :name (elt args 0)
+                :buffer buffer
+                :command (append args nil))))
+        (dape--display-buffer buffer)
+        `(:processID ,(process-id p))))))
 
 ;; (cl-defmethod dape-handle-request (_conn (_command (eql startDebugging)) arguments)
 ;;   "Handle startDebugging requests.
@@ -1049,11 +1051,11 @@ Starts a new process to run process to be debugged."
 
 ;;; Events
 
-(cl-defgeneric dape-handle-event (_process event body)
+(cl-defgeneric dape-handle-event (_process event &key body &allow-other-keys)
   "Sink for all unsupported events."
   (dape--debug 'info "Unhandled event '%S' with body %S" event body))
 
-(cl-defmethod dape-handle-event (conn (_event (eql initialized)) &allow-other-keys)
+(cl-defmethod dape-handle-event (conn (_event (eql initialized)) &key &allow-other-keys)
   "Handle initialized events."
   (dape--update-state "initialized")
   (dape--configure-exceptions conn)
@@ -1157,10 +1159,11 @@ Starts a new process to run process to be debugged."
   :documentation
   "Represents a DAP debugger. Wraps a process for DAP communication.")
 
-(cl-defmethod jsonrpc-convert-from-jsonrpc ((conn dape-dap-debugger) message)
-  (cl-destructuring-bind (&key method id error params
-                               (result nil result-supplied-p)
-                               _jsonrpc)
+(cl-defmethod jsonrpc-convert-to-endpoint ((conn dape-dap-debugger)
+                                           message method)
+  "Convert JSONRPC MESSAGE to DAP's JSONRPCesque format."
+  (cl-destructuring-bind (&key ((:method _ignored)) id error params
+                               (result nil result-supplied-p))
       message
     (with-slots (last-id n-sent-notifs) conn
       (cond ((null id) ; a notification to the dap server
@@ -1180,16 +1183,17 @@ Starts a new process to run process to be debugged."
              (cl-list* :type "response"
                        :seq (+ (setq last-id id) n-sent-notifs)
                        :request_seq last-id
+                       :command method
                        :success t
                        (and result `(:body ,result))))
             (method ; a request
-             (list :type "request"
-                   :seq (+ (setq last-id id) n-sent-notifs)
-                   :request_seq last-id
-                   :command method
-                   :arguments params))))))
+             `(:type "request"
+                    :seq ,(+ (setq last-id id) n-sent-notifs)
+                    :command ,method
+                    ,@(when params `(:arguments ,params))))))))
 
-(cl-defmethod jsonrpc-convert-to-jsonrpc ((conn dape-dap-debugger) dap-message)
+(cl-defmethod jsonrpc-convert-from-endpoint ((conn dape-dap-debugger) dap-message)
+  "Convert JSONRPCesque DAP-MESSAGE to JSONRPC plist."
   (cl-destructuring-bind (&key type request_seq seq command arguments
                                event body success message &allow-other-keys)
       dap-message
@@ -1298,6 +1302,9 @@ Starts a new process to run process to be debugged."
                   :kill-inferior-on-exit (not on-behalf-p)
                   :request-dispatcher (lambda (conn method args)
                                         (apply #'dape-handle-request conn method args))
+                  :notification-dispatcher (lambda (conn method args)
+                                             (if (eql method 'initialized)
+                                                 (apply #'dape-handle-event conn method args)))
                   :on-shutdown (lambda (conn)
                                  (setq dape--config nil)
                                  (dape--remove-stack-pointers)
@@ -1326,8 +1333,9 @@ Starts a new process to run process to be debugged."
           (make-instance
            'dape-dap-debugger
            :name "DAPEDOPE"
-           :request-dispatcher nil
-           :notification-dispatcher nil
+           :request-dispatcher (lambda (conn method args)
+                                 (apply #'dape-handle-request conn method args))
+           :notification-dispatcher #'ignore ;; FIXME
            :events-buffer-scrollback-size nil
            :on-shutdown (lambda (_conn)
                           (with-current-buffer buffer
