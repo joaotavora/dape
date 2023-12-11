@@ -1155,73 +1155,64 @@ Starts a new process to run process to be debugged."
 (defclass dape-dap-debugger (jsonrpc-process-connection)
   ((last-id
     :initform 0
-    :documentation "Used for converting JSONRPC id numbers to DAP seq numbers." )
+    :documentation "Used for converting JSONRPC's `id' to DAP' `seq'.")
    (n-sent-notifs
     :initform 0
-    :documentation "Used for converting JSONRPC id numbers to DAP seq numbers." )
-   (kill-inferior-on-exit
-    :initform nil
-    :initarg :kill-inferior-on-exit))
+    :documentation "Used for converting JSONRPC's `id' to DAP' `seq'.")
+   (kill-inferior-on-exit :initform nil
+                          :initarg :kill-inferior-on-exit))
   :documentation
   "Represents a DAP debugger. Wraps a process for DAP communication.")
 
 (cl-defmethod jsonrpc-convert-to-endpoint ((conn dape-dap-debugger)
-                                           message method)
+                                           message subtype)
   "Convert JSONRPC MESSAGE to DAP's JSONRPCesque format."
-  (cl-destructuring-bind (&key ((:method _ignored)) id error params
+  (cl-destructuring-bind (&key method id error params
                                (result nil result-supplied-p))
       message
     (with-slots (last-id n-sent-notifs) conn
-      (cond ((null id) ; a notification to the dap server
+      (cond ((eq subtype 'notification)
              (cl-incf n-sent-notifs)
-             (list :type "event"
-                   :seq (+ last-id n-sent-notifs)
-                   :event method
-                   :body params))
-            (error ; an error response to the dap server
-             (list :type "response"
-                   :seq (+ (setq last-id id) n-sent-notifs)
-                   :request_seq last-id
-                   :success :json-false
-                   :message (plist-get error :message)
-                   :body (plist-get error :data)))
-            (result-supplied-p ; a success response to the dap server
-             (cl-list* :type "response"
-                       :seq (+ (setq last-id id) n-sent-notifs)
-                       :request_seq last-id
-                       :command method
-                       :success t
-                       (and result `(:body ,result))))
-            (method ; a request
+             `(:type "event"
+                     :seq ,(+ last-id n-sent-notifs)
+                     :event ,method
+                     :body ,params))
+            ((eq subtype 'request)
              `(:type "request"
                     :seq ,(+ (setq last-id id) n-sent-notifs)
                     :command ,method
-                    ,@(when params `(:arguments ,params))))))))
+                    ,@(when params `(:arguments ,params))))
+            (t
+             (cond (error
+                    `(:type "response"
+                            :seq ,(+ (setq last-id id) n-sent-notifs)
+                            :request_seq ,last-id
+                            :success :json-false
+                            :message ,(plist-get error :message)
+                            :body ,(plist-get error :data)))
+                   (result-supplied-p
+                    `(:type "response"
+                            :seq ,(+ (setq last-id id) n-sent-notifs)
+                            :request_seq ,last-id
+                            :command ,method
+                            :success t
+                            ,@(and result `(:body ,result))))))))))
 
-(cl-defmethod jsonrpc-convert-from-endpoint ((conn dape-dap-debugger) dap-message)
+(cl-defmethod jsonrpc-convert-from-endpoint ((_conn dape-dap-debugger) dap-message)
   "Convert JSONRPCesque DAP-MESSAGE to JSONRPC plist."
   (cl-destructuring-bind (&key type request_seq seq command arguments
                                event body success message &allow-other-keys)
       dap-message
-    (with-slots (last-id n-sent-notifs) conn
-      (cond ((string= type "event") ; a notification from the dap server
-             (list :jsonrpc "2.0"
-                   :method event
-                   :params body))
-            ((eq success :json-false) ; an error response from the dap server
-             (list :jsonrpc "2.0"
-                   :id (or request_seq seq)
-                   :error (list :code 32600
-                                :message (or (plist-get body :error) message))))
-            ((eq success t) ; a successful response from the dap server
-             (list :jsonrpc "2.0"
-                   :id (or request_seq seq)
-                   :result body))
-            (command ; a request from the dap server
-             (list :jsonrpc "2.0"
-                   :id (or request_seq seq)
-                   :method command
-                   :params arguments))))))
+    (cond ((string= type "event")
+           `(:jsonrpc "2.0" :method ,event :params ,body))
+          ((eq success :json-false)
+           `(:jsonrpc "2.0" :id ,request_seq
+                      :error ,(list :code 32600
+                                   :message (or (plist-get body :error) message))))
+          ((eq success t)
+           `(:jsonrpc "2.0" :id ,request_seq :result ,body))
+          (command
+           `(:jsonrpc "2.0" :id ,seq :method ,command :params ,arguments)))))
 
 
 ;;; Startup/Setup
