@@ -721,9 +721,9 @@ On SKIP-PROCESS-BUFFERS skip deletion of buffers which has processes."
 See `dape-debug-on' for TYPE information."
   (when (memq type dape--debug-on)
     (when dape--debugger
-      (jsonrpc--debug dape--debugger
-                      (format "%s: %s" type fmt)
-                      args))
+      (apply #'jsonrpc--debug dape--debugger
+             (format "%s: %s" type fmt)
+             args))
     (apply #'message (format "%s: %s" type fmt) args)))
 
 (defun dape--live-process (&optional nowarn)
@@ -1051,7 +1051,9 @@ Starts a new process to run process to be debugged."
 
 ;;; Events
 
-(cl-defgeneric dape-handle-event (_process event &key body &allow-other-keys)
+(cl-defgeneric dape-handle-event (_process event &key body &allow-other-keys))
+
+(cl-defmethod dape-handle-event (_process event &rest body &key &allow-other-keys)
   "Sink for all unsupported events."
   (dape--debug 'info "Unhandled event '%S' with body %S" event body))
 
@@ -1111,34 +1113,36 @@ Starts a new process to run process to be debugged."
                           'error))))
 
 (cl-defmethod dape-handle-event (_conn (_event (eql continued))
-                                       body)
+                                       &key threadId &allow-other-keys)
   "Handle continued events."
   (dape--update-state "running")
   (dape--remove-stack-pointers)
   (unless dape--thread-id
-    (setq dape--thread-id (plist-get body :threadId))))
+    (setq dape--thread-id threadId)))
 
-(cl-defmethod dape-handle-event (_process (_event (eql output)) body)
+(cl-defmethod dape-handle-event (_process (_event (eql output))
+                                          &key category output &allow-other-keys)
   "Handle output events."
-  (pcase (plist-get body :category)
+  (pcase category
     ("stdout"
-     (dape--repl-message (plist-get body :output)))
+     (dape--repl-message output))
     ("stderr"
-     (dape--repl-message (plist-get body :output) 'error))
+     (dape--repl-message output 'error))
     ((or "console" "output")
-     (dape--repl-message (plist-get body :output)))))
+     (dape--repl-message output))))
 
-(cl-defmethod dape-handle-event (_process (_event (eql exited)) body)
+(cl-defmethod dape-handle-event (_process (_event (eql exited))
+                                          &key exitCode &allow-other-keys)
   "Handle exited events."
   (dape--update-state "exited")
   (dape--remove-stack-pointers)
-  (dape--repl-message (format "* Exit code: %d *"
-                              (plist-get body :exitCode))
-                      (if (zerop (plist-get body :exitCode))
+  (dape--repl-message (format "* Exit code: %d *" exitCode)
+                      (if (zerop exitCode)
                           'dape-repl-exit-code-exit
                         'dape-repl-exit-code-fail)))
 
-(cl-defmethod dape-handle-event (_process (_event (eql terminated)) _body)
+(cl-defmethod dape-handle-event (_process (_event (eql terminated))
+                                          &key &allow-other-keys)
   "Handle terminated events."
   (dape--update-state "terminated")
   (dape--remove-stack-pointers)
@@ -1303,8 +1307,7 @@ Starts a new process to run process to be debugged."
                   :request-dispatcher (lambda (conn method args)
                                         (apply #'dape-handle-request conn method args))
                   :notification-dispatcher (lambda (conn method args)
-                                             (if (eql method 'initialized)
-                                                 (apply #'dape-handle-event conn method args)))
+                                             (apply #'dape-handle-event conn method args))
                   :on-shutdown (lambda (conn)
                                  (setq dape--config nil)
                                  (dape--remove-stack-pointers)
